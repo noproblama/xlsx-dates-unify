@@ -1,0 +1,962 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Calendar / Unify — Academic Calendar Converter</title>
+<link rel="preconnect" href="https://cdnjs.cloudflare.com" />
+<style>
+  html, body { margin: 0; padding: 0; background: #F6F7F5; }
+  * { box-sizing: border-box; }
+  #root { min-height: 100vh; }
+  #boot { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; color: #6B7280; padding: 60px; text-align: center; }
+</style>
+</head>
+<body>
+<div id="root"><div id="boot">Loading converter…</div></div>
+
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script crossorigin src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+
+<script type="text/babel" data-presets="react">
+const { useState, useRef, useMemo, useCallback, useEffect } = React;
+const XLSX = window.XLSX;
+
+
+/* ---------- session persistence (localStorage in standalone build) ---------- */
+const SAVE_KEY = "calconv-session-v1";
+const storageAvailable = () => { try { const k="__t"; localStorage.setItem(k,"1"); localStorage.removeItem(k); return true; } catch { return false; } };
+async function saveSession(payload) {
+  try { localStorage.setItem(SAVE_KEY, JSON.stringify(payload)); return true; } catch { return false; }
+}
+async function loadSession() {
+  try { const v = localStorage.getItem(SAVE_KEY); return v ? JSON.parse(v) : null; } catch { return null; }
+}
+async function clearSession() {
+  try { localStorage.removeItem(SAVE_KEY); } catch {}
+}
+/* API key persisted locally so colleagues need only paste it once */
+const KEY_STORE = "calconv-apikey";
+const getApiKey = () => { try { return localStorage.getItem(KEY_STORE) || ""; } catch { return ""; } };
+const setApiKeyStored = (k) => { try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch {} };
+
+/* ============================================================
+   Academic Calendar Converter — "Registrar's Workbench"
+   Upload xlsx → confirm column↔module mapping → AI-assisted
+   conversion to the unified event format → review → export.
+   ============================================================ */
+
+const MONTHS = { jan: 1, feb: 2, mar: 3, apr: 4, may: 5, jun: 6, june: 6, jul: 7, july: 7, aug: 8, sep: 9, sept: 9, oct: 10, nov: 11, dec: 12 };
+const WEEKDAYS = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+
+const YEAR_COLORS = {
+  "MSc Year 1": { band: "#EAD5D3", ink: "#9A5B54" },
+  "MSc Year 2": { band: "#DCE8D6", ink: "#5F7F55" },
+  "MSc Year 3": { band: "#F2E8C6", ink: "#94803B" },
+  "Other": { band: "#E2E7EC", ink: "#5B6B7C" },
+};
+
+function colLetter(c) { let s = "", n = c; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
+
+/* short codes for columns without a module number (key = lowercased, whitespace-collapsed header) */
+const KNOWN_CODES = {
+  "learning webinars yr1 (thursdays) & wellbeing webinars & module evaluation circles & student-faculty circles": "LY1 & WW & ME && SFc",
+  "personal tutor year 1 meetings & co-creative circles": "PTY1 & Ccc",
+  "learning groups year 2 & wellbeing webinars": "LGY2 & WW",
+  "personal tutor meetings & co-creative circles": "PT & Ccc",
+  "learning group and academic well-being webinars": "LG & AWW",
+  "other academic, operational & community events": "OTHER",
+};
+function fallbackCode(name) {
+  const key = name.toLowerCase().replace(/\s+/g, " ").trim();
+  if (KNOWN_CODES[key]) return KNOWN_CODES[key];
+  return name.split(/\s*&\s*/).map(seg =>
+    seg.trim().split(/[\s\-]+/).filter(Boolean).map(w => (/\d/.test(w) ? w.toUpperCase() : w[0].toUpperCase())).join("").slice(0, 6)
+  ).join(" & ");
+}
+
+function parseWeekLabel(label) {
+  if (!label) return null;
+  const m = String(label).match(/(\d{1,2})\s*-?\s*([A-Za-z]{3,9})\.?\s*-?\s*(\d{2,4})/);
+  if (!m) return null;
+  const mon = MONTHS[m[2].toLowerCase().slice(0, 4)] ?? MONTHS[m[2].toLowerCase().slice(0, 3)];
+  if (!mon) return null;
+  let y = parseInt(m[3], 10); if (y < 100) y += 2000;
+  const d = parseInt(m[1], 10);
+  if (d < 1 || d > 31) return null;
+  return `${y}-${String(mon).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+}
+
+const TIME_RE = /\d{1,2}[:.]\d{2}|\b\d{1,2}\s?(?:am|pm)\b/i;
+const DATE_RE = /\b\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)|(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\.?\s+\d{1,2}/i;
+const CONVERTED_RE = /^\s*\[\d{4}-\d{2}-\d{2}/m;
+
+function classifyCell(text) {
+  const t = String(text).trim();
+  if (!t) return "empty";
+  if (CONVERTED_RE.test(t)) return "done";
+  if (TIME_RE.test(t) || DATE_RE.test(t)) return "ai";
+  return "annotation"; // no dates/times → wrap in *…*
+}
+
+/* ---------- workbook detection ---------- */
+function detectStructure(ws) {
+  const grid = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: "" });
+  const merges = ws["!merges"] || [];
+  let leaderRow = -1;
+  for (let r = 0; r < Math.min(grid.length, 30); r++) {
+    if (String(grid[r]?.[0] || "").trim().toLowerCase() === "module leader") { leaderRow = r; break; }
+  }
+  const headerRow = leaderRow > 0 ? leaderRow - 1 : 6;
+  const webinarRow = leaderRow >= 0 ? leaderRow + 1 : 8;
+  // year bands from merges on row 0
+  const bands = merges.filter(m => m.s.r === 0).map(m => ({ c0: m.s.c, c1: m.e.c, label: String(grid[0]?.[m.s.c] || "").trim() }));
+  const yearOf = (c) => {
+    for (const b of bands) if (c >= b.c0 && c <= b.c1) {
+      const l = b.label;
+      if (/year\s*1/i.test(l)) return "MSc Year 1";
+      if (/year\s*2/i.test(l)) return "MSc Year 2";
+      if (/year\s*3/i.test(l)) return "MSc Year 3";
+      return "Other";
+    }
+    return "Other";
+  };
+  const mapping = [];
+  const hdr = grid[headerRow] || [];
+  let lastCol = 0;
+  for (let c = 1; c < hdr.length; c++) if (String(hdr[c] || "").trim()) lastCol = c;
+  for (let c = 1; c <= lastCol; c++) {
+    const name = String(hdr[c] || "").replace(/\s+/g, " ").trim();
+    if (!name) continue;
+    const codeM = name.match(/\b(\d{4}[A-Z]+)\b/);
+    mapping.push({
+      col: c, name, code: codeM ? codeM[1] : fallbackCode(name),
+      leader: String(grid[leaderRow]?.[c] || "").replace(/\s+/g, " ").trim(),
+      year: yearOf(c), include: true,
+    });
+  }
+  // last data row
+  let lastRow = grid.length - 1;
+  while (lastRow > webinarRow && grid[lastRow].every(v => !String(v).trim())) lastRow--;
+  return { grid, merges, leaderRow, headerRow, webinarRow, dataStart: webinarRow + 1, lastRow, mapping };
+}
+
+/* ---------- build cell work-list ---------- */
+function buildCells(st) {
+  const cells = [];
+  const cols = st.mapping.filter(m => m.include);
+  const colSet = new Map(cols.map(m => [m.col, m]));
+  const weekOf = (r) => {
+    // walk up column A for the nearest week label
+    for (let rr = r; rr >= st.dataStart - 1; rr--) {
+      const iso = parseWeekLabel(st.grid[rr]?.[0]);
+      if (iso) return { iso, label: String(st.grid[rr][0]).replace(/\s+/g, " ").trim() };
+    }
+    return null;
+  };
+  const push = (r, c, kindOverride) => {
+    const text = String(st.grid[r]?.[c] ?? "");
+    const kind = kindOverride || classifyCell(text);
+    if (kind === "empty" || kind === "done") return;
+    const mod = colSet.get(c);
+    cells.push({
+      id: `${r}:${c}`, r, c, original: text, kind,
+      module: mod || null,
+      week: r < st.headerRow ? { iso: null, label: "Orientation / pre-term" } : weekOf(r),
+      status: kind === "annotation" || kind === "header" ? "auto" : "pending",
+      converted: kind === "annotation" || kind === "header" ? `*${text.trim()}*` : "",
+      confidence: kind === "ai" ? null : "high", notes: "",
+    });
+  };
+  // orientation rows (above header) — only columns inside mapped range
+  for (let r = 1; r < st.headerRow; r++)
+    for (const m of cols) if (String(st.grid[r]?.[m.col] || "").trim()) push(r, m.col);
+  // header / leader / webinar-day rows → asterisk annotations
+  for (const r of [st.headerRow, st.leaderRow, st.webinarRow])
+    for (const m of cols) if (r >= 0 && String(st.grid[r]?.[m.col] || "").trim()) push(r, m.col, "header");
+  // data rows
+  for (let r = st.dataStart; r <= st.lastRow; r++)
+    for (const m of cols) if (String(st.grid[r]?.[m.col] || "").trim()) push(r, m.col);
+  return cells;
+}
+
+/* ---------- Claude API ---------- */
+function systemPrompt(tagging) {
+  return `You convert one messy academic-calendar spreadsheet cell into a strict structured format for script automation.
+
+OUTPUT — build the cell's new content from these elements:
+1. Timed event, one line each:
+[YYYY-MM-DD] Weekday HH:MM-HH:MM TZ | Title (people, place);
+2. Multi-day / multi-week span with no specific time:
+[YYYY-MM-DD..YYYY-MM-DD] | Title;
+3. Deadline or due date:
+[YYYY-MM-DD] Weekday | DEADLINE: Title;
+4. Text that is not a schedulable item (a heading with no inferable date, a note) wrapped in asterisks on its own line: *text*
+
+Do NOT append the original cell text — output only the reformatted structured lines above.
+
+ORDERING — preserve the original reading order of the cell. If a heading or label introduces the cell (e.g. "Reflective sessions round 1"), its line comes FIRST, before the events it introduces. A trailing note stays at the end. In general: emit lines in the same top-to-bottom order they appear in the source, just reformatted.
+
+NAMED PERIODS — if a heading names a period that lasts a week or more ("Orientation Week", "Reading Week", "Group Presentation Activity", "X starts (two weeks)"), emit it as a SPAN line (rule 2) rather than a plain *asterisk* heading, and put it FIRST. Infer the span bounds from context: if the period has dated events inside it, cover the Monday–Friday working week containing those events; otherwise use the week-commencing date (Monday) through that Friday, or any explicit bounds given. Then list the individual dated events below it. Only fall back to an *asterisk* heading if no date can be inferred at all.
+
+RULES
+- 24-hour zero-padded times, format HH:MM-HH:MM. If only a start time is given, write HH:MM and flag in notes.
+- Timezone: use the one stated. If absent, infer from the date: BST before 2025-10-26 and from 2026-03-29 onward; GMT in between. Academic year Sep 2025 – Aug 2026: infer the year from the month.
+- The Weekday MUST match the computed date. If the stated weekday and date disagree, trust the DATE, output the correct weekday, and mention the discrepancy in notes.
+- Split multi-event cells into one line per event, keeping source order. Expand compact listings (e.g. tutor slots A/B) into individual lines.
+- Titles concise; facilitator initials/names and venue go in parentheses after the title.
+- "X starts (two weeks)" or similar → span line covering those weeks starting from the week-commencing date.
+- Never invent dates or times that are not stated or clearly implied. If something is TBC or has no date, use *asterisk annotation*.
+- A "week commencing" date is given as context; events normally fall in that week — note it if they don't.${tagging ? `
+- MODULE TAGGING IS ON: append the module code in square brackets at the end of every structured line's title, before the semicolon, e.g. "| Intro Webinar (BB) [7501ALEFTP];". If no facilitator is named for an event, add the module leader initials in parentheses.` : ""}
+
+EXAMPLE
+Cell: "Intro webinar Wed. Sept. 24, 15:30–17:00 BST - EL" →
+[2025-09-24] Wednesday 15:30-17:00 BST | Intro webinar (EL);
+
+EXAMPLE (named period → span, heading first)
+Cell: "Orientation Week: Year 1 orientation meetings: Tuesday 16 Sept (10:00-11:00 & 18:00-19:00) - BBB Community site  Cocreative circles webinar: Thursday 18 Sept, 14:00-15:00 BST Learning yr 1 site" →
+[2025-09-15..2025-09-19] | Orientation Week;
+[2025-09-16] Tuesday 10:00-11:00 BST | Year 1 orientation meeting (BBB Community site);
+[2025-09-16] Tuesday 18:00-19:00 BST | Year 1 orientation meeting (BBB Community site);
+[2025-09-18] Thursday 14:00-15:00 BST | Cocreative circles webinar (Learning yr 1 site);
+
+Confidence: use "high" only when the conversion is unambiguous. Use "medium" or "low" when anything was guessed, corrected, or unclear (inferred timezone, missing end time, ambiguous date, reordered content, uncertain facilitator, etc.). Whenever confidence is "medium" or "low", the notes field MUST briefly state the specific reason in plain language (e.g. "end time not given, left open" or "timezone inferred as GMT from the date"). Keep it to one short sentence. When confidence is "high", notes may be empty.
+
+Respond ONLY with raw JSON, no markdown fences:
+{"converted":"<full new cell text>","confidence":"high|medium|low","notes":"<reason if not high; short and specific; empty string only when high>"}`;
+}
+
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+/* remove the trailing "(original text)" audit block from a converted cell */
+function stripOriginal(text) {
+  return String(text).replace(/\n\s*\n\([\s\S]*\)\s*$/, "").trim();
+}
+
+/* pull the JSON object out of a reply that may have prose around it */
+function extractJson(text) {
+  const clean = text.replace(/```json|```/g, "").trim();
+  try { return JSON.parse(clean); } catch { /* fall through */ }
+  const a = clean.indexOf("{"), b = clean.lastIndexOf("}");
+  if (a >= 0 && b > a) return JSON.parse(clean.slice(a, b + 1));
+  throw new Error("no JSON in reply");
+}
+
+async function callClaude(cell, tagging) {
+  const ctx = [
+    cell.week ? `Week commencing: ${cell.week.iso || "unknown"} (row label: "${cell.week.label}")` : "Week commencing: unknown",
+    cell.module ? `Column/module: ${cell.module.name}${cell.module.code ? ` (code ${cell.module.code}` : "("}${cell.module.leader ? `, leader ${cell.module.leader}` : ""}, ${cell.module.year})` : "Column: unknown",
+    `Module tagging: ${tagging ? "ON" : "off"}`,
+  ].join("\n");
+
+  const MAX_TRIES = 4;
+  let lastErr = null;
+  for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
+    try {
+      const strict = attempt > 1 ? "\n\nIMPORTANT: reply with ONLY the raw JSON object, starting with { and ending with }. No explanation, no preamble, no markdown." : "";
+      const res = await fetch("https://api.anthropic.com/v1/messages", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "x-api-key": getApiKey(),
+          "anthropic-version": "2023-06-01",
+          "anthropic-dangerous-direct-browser-access": "true",
+        },
+        body: JSON.stringify({
+          model: "claude-sonnet-4-6", max_tokens: 1000,
+          system: systemPrompt(tagging),
+          messages: [{ role: "user", content: `${ctx}\n\nCell text:\n"""${cell.original}"""${strict}` }],
+        }),
+      });
+      if (res.status === 429 || res.status === 529 || res.status >= 500) {
+        lastErr = new Error(`API ${res.status}`);
+        await sleep(3000 * attempt + Math.random() * 2000);   // back off and retry
+        continue;
+      }
+      if (!res.ok) throw new Error(`API ${res.status}`);
+      const data = await res.json();
+      const text = (data.content || []).filter(b => b.type === "text").map(b => b.text).join("\n");
+      const j = extractJson(text);
+      if (!j.converted) throw new Error("empty result");
+      return { converted: String(j.converted).trim(), confidence: j.confidence || "medium", notes: j.notes || "" };
+    } catch (e) {
+      lastErr = e;
+      if (attempt < MAX_TRIES) await sleep(1500 * attempt);   // parse failures etc. → retry with strict reminder
+    }
+  }
+  throw lastErr || new Error("failed");
+}
+
+/* ---------- parse converted text back into events (for JSON export) ---------- */
+const EV_TIMED = /^\[(\d{4}-\d{2}-\d{2})\]\s+([A-Za-z]+)\s+(\d{2}:\d{2})(?:-(\d{2}:\d{2}))?\s+(BST|GMT)\s*\|\s*(.+?);?\s*$/;
+const EV_SPAN = /^\[(\d{4}-\d{2}-\d{2})\.\.(\d{4}-\d{2}-\d{2})\]\s*\|\s*(.+?);?\s*$/;
+const EV_DEADLINE = /^\[(\d{4}-\d{2}-\d{2})\]\s+([A-Za-z]+)\s*\|\s*DEADLINE:\s*(.+?);?\s*$/;
+
+function extractEvents(cells) {
+  const out = [];
+  for (const cell of cells) {
+    if (!cell.converted) continue;
+    for (const raw of cell.converted.split("\n")) {
+      const line = raw.trim();
+      let m;
+      if ((m = line.match(EV_DEADLINE))) out.push({ type: "deadline", date: m[1], weekday: m[2], title: m[3], cell: cellRefOf(cell) });
+      else if ((m = line.match(EV_SPAN))) out.push({ type: "span", start: m[1], end: m[2], title: m[3], cell: cellRefOf(cell) });
+      else if ((m = line.match(EV_TIMED))) out.push({ type: "event", date: m[1], weekday: m[2], start: m[3], end: m[4] || null, tz: m[5], title: m[6], cell: cellRefOf(cell) });
+    }
+  }
+  return out;
+}
+function cellRefOf(cell) {
+  return { ref: `${colLetter(cell.c + 1)}${cell.r + 1}`, module: cell.module?.code || cell.module?.name || null, leader: cell.module?.leader || null, year: cell.module?.year || null, week: cell.week?.iso || null };
+}
+
+/* ---------- weekday sanity check on a converted cell ---------- */
+function lintConverted(text) {
+  const issues = [];
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    const m = line.match(EV_TIMED) || line.match(EV_DEADLINE);
+    if (m) {
+      const d = new Date(m[1] + "T12:00:00Z");
+      const wd = WEEKDAYS[d.getUTCDay()];
+      if (m[2] && m[2].toLowerCase() !== wd.toLowerCase()) issues.push(`${m[1]} is a ${wd}, but the line says ${m[2]}`);
+    }
+    // timed event with a start but no end time
+    const t = line.match(EV_TIMED);
+    if (t && !t[4]) issues.push(`${t[1]}: only a start time — no end time given`);
+  }
+  return issues;
+}
+
+/* ============================================================
+   UI
+   ============================================================ */
+const S = {
+  ink: "#22262B", muted: "#6B7280", paper: "#F6F7F5", panel: "#FFFFFF",
+  line: "#E2E5E1", accent: "#2E5E63", accentSoft: "#E4EEEF",
+  amber: "#B4700F", amberSoft: "#FBF3E2", green: "#3E7D4E", greenSoft: "#E9F2EA",
+  red: "#A33D3D", redSoft: "#F7E9E9",
+  mono: "ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace",
+  sans: "-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
+};
+
+const CONF_STYLE = {
+  high: { c: S.green, bg: S.greenSoft, label: "looks clean", tip: "Claude is confident this conversion is correct — a quick glance is usually enough." },
+  medium: { c: S.amber, bg: S.amberSoft, label: "worth a look", tip: "Probably fine, but Claude wasn't fully certain — check it before accepting." },
+  low: { c: S.red, bg: S.redSoft, label: "needs checking", tip: "Claude was unsure or found an inconsistency — verify this one carefully." },
+};
+
+/* syntax-highlighted preview of the unified format */
+function Highlight({ text }) {
+  const lines = String(text).split("\n");
+  let inOriginal = false;
+  return (
+    <pre style={{ margin: 0, fontFamily: S.mono, fontSize: 12.5, lineHeight: 1.65, whiteSpace: "pre-wrap", wordBreak: "break-word" }}>
+      {lines.map((ln, i) => {
+        const t = ln.trim();
+        if (!inOriginal && t.startsWith("(")) inOriginal = true;
+        if (inOriginal) { const done = t.endsWith(")"); const el = <div key={i} style={{ color: "#9AA1A9" }}>{ln}</div>; if (done) inOriginal = false; return el; }
+        if (/^\*.*\*$/.test(t)) return <div key={i} style={{ color: S.amber, fontStyle: "italic" }}>{ln}</div>;
+        const m = ln.match(/^(\s*)(\[[^\]]+\])(\s*)([A-Za-z]+)?(\s*)([\d:.\-]+)?(\s*)(BST|GMT)?(\s*\|\s*)?(.*)$/);
+        if (m && m[2]) {
+          return (
+            <div key={i}>
+              {m[1]}<span style={{ color: S.accent, fontWeight: 600 }}>{m[2]}</span>{m[3]}
+              {m[4] && <span style={{ color: "#8A929B" }}>{m[4]}</span>}{m[5]}
+              {m[6] && <span style={{ color: S.ink, fontWeight: 600 }}>{m[6]}</span>}{m[7]}
+              {m[8] && <span style={{ color: "#8A929B", fontSize: 11 }}>{m[8]}</span>}
+              {m[9] && <span style={{ color: "#C0C6CC" }}>{m[9]}</span>}
+              <span style={{ color: /^DEADLINE:/.test(m[10] || "") ? S.red : S.ink }}>{m[10]}</span>
+            </div>
+          );
+        }
+        return <div key={i}>{ln}</div>;
+      })}
+    </pre>
+  );
+}
+
+function Tag({ children, color, bg, title }) {
+  return <span title={title} style={{ fontFamily: S.mono, fontSize: 10.5, letterSpacing: "0.06em", textTransform: "uppercase", color, background: bg, borderRadius: 3, padding: "2px 7px", whiteSpace: "nowrap", cursor: title ? "help" : "default" }}>{children}</span>;
+}
+
+function Btn({ children, onClick, primary, disabled, small, danger }) {
+  return (
+    <button onClick={onClick} disabled={disabled} style={{
+      fontFamily: S.sans, fontSize: small ? 12 : 13.5, fontWeight: 600, cursor: disabled ? "default" : "pointer",
+      padding: small ? "5px 12px" : "9px 20px", borderRadius: 5,
+      border: `1px solid ${primary ? S.accent : danger ? S.red : S.line}`,
+      background: primary ? S.accent : danger ? S.redSoft : "#fff",
+      color: primary ? "#fff" : danger ? S.red : S.ink, opacity: disabled ? 0.45 : 1, transition: "opacity .15s",
+    }}>{children}</button>
+  );
+}
+
+const STEP_NAMES = ["Upload", "Map columns", "Convert", "Review", "Export"];
+
+function ApiKeyControl({ apiKey, onChange }) {
+  const [open, setOpen] = React.useState(false);
+  const [val, setVal] = React.useState(apiKey);
+  const has = !!apiKey;
+  return (
+    <div style={{ position: "relative", marginRight: 6 }}>
+      <button onClick={() => { setVal(apiKey); setOpen(o => !o); }} title="Anthropic API key (needed only to run AI conversion)"
+        style={{ fontFamily: "ui-monospace, Menlo, monospace", fontSize: 10.5, padding: "4px 10px", borderRadius: 3, cursor: "pointer",
+          border: `1px solid ${has ? "#3E7D4E" : "#B4700F"}`, background: has ? "#E9F2EA" : "#FBF3E2", color: has ? "#3E7D4E" : "#B4700F" }}>
+        {has ? "● API key set" : "○ Add API key"}
+      </button>
+      {open && (
+        <div style={{ position: "absolute", right: 0, top: 30, zIndex: 60, background: "#fff", border: "1px solid #E2E5E1", borderRadius: 8, padding: 14, width: 340, boxShadow: "0 8px 24px rgba(0,0,0,0.12)" }}>
+          <div style={{ fontSize: 12.5, fontWeight: 700, marginBottom: 6 }}>Anthropic API key</div>
+          <div style={{ fontSize: 11.5, color: "#6B7280", lineHeight: 1.5, marginBottom: 8 }}>
+            Only needed to run AI conversion from scratch. If you're reviewing a session someone already converted, you can skip this. The key is stored only in this browser and sent directly to Anthropic.
+          </div>
+          <input type="password" value={val} onChange={e => setVal(e.target.value)} placeholder="sk-ant-…"
+            style={{ width: "100%", fontFamily: "ui-monospace, Menlo, monospace", fontSize: 12, border: "1px solid #E2E5E1", borderRadius: 5, padding: "6px 8px", boxSizing: "border-box", marginBottom: 8 }} />
+          <div style={{ display: "flex", gap: 8, justifyContent: "flex-end" }}>
+            {has && <button onClick={() => { onChange(""); setVal(""); setOpen(false); }} style={{ fontSize: 12, padding: "5px 10px", borderRadius: 5, border: "1px solid #E2E5E1", background: "#fff", color: "#A33D3D", cursor: "pointer" }}>Remove</button>}
+            <button onClick={() => { onChange(val.trim()); setOpen(false); }} style={{ fontSize: 12, fontWeight: 600, padding: "5px 12px", borderRadius: 5, border: "1px solid #2E5E63", background: "#2E5E63", color: "#fff", cursor: "pointer" }}>Save</button>
+          </div>
+          <div style={{ fontSize: 10.5, color: "#9AA1A9", marginTop: 8 }}>Get a key at console.anthropic.com → API Keys.</div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+function CalendarConverter() {
+  const [step, setStep] = useState(0);
+  const [fileName, setFileName] = useState("");
+  const [wb, setWb] = useState(null);
+  const [sheetName, setSheetName] = useState("");
+  const [st, setSt] = useState(null);           // detected structure
+  const [tagging, setTagging] = useState(false);
+  const [originalMode, setOriginalMode] = useState("drop");   // 'cell' | 'comment' | 'drop'
+  const [textOut, setTextOut] = useState(null);              // { title, text, filename, note } manual copy/download modal
+  const [copied, setCopied] = useState(false);
+  const [cells, setCells] = useState([]);
+  const [running, setRunning] = useState(false);
+  const [progress, setProgress] = useState({ done: 0, total: 0 });
+  const [filter, setFilter] = useState("review");
+  const [error, setError] = useState("");
+  const [apiKey, setApiKey] = useState(getApiKey());
+  const hasKey = !!apiKey;
+  const [savedSession, setSavedSession] = useState(null);   // found on mount, offered for resume
+  const [lastSaved, setLastSaved] = useState(null);
+  const stopRef = useRef(false);
+  const fileRef = useRef(null);
+  const sessionRef = useRef(null);
+  const skipNextSave = useRef(false);
+
+  /* ---------- persistence ---------- */
+  useEffect(() => { loadSession().then(s => { if (s?.cells?.length) setSavedSession(s); }); }, []);
+
+  useEffect(() => {
+    if (step === 0 || !st || skipNextSave.current) { skipNextSave.current = false; return; }
+    const t = setTimeout(async () => {
+      const ok = await saveSession({ v: 1, ts: Date.now(), fileName, sheetName, tagging, originalMode, step: step === 2 ? 3 : step, st, cells });
+      if (ok) { setLastSaved(Date.now()); setCells(prev => prev.some(c => c.dirty) ? prev.map(c => c.dirty ? { ...c, dirty: false } : c) : prev); }
+    }, 1200);
+    return () => clearTimeout(t);
+  }, [step, st, cells, tagging, originalMode, fileName, sheetName]);
+
+  const restoreSaved = () => {
+    const s = savedSession;
+    skipNextSave.current = true;
+    setFileName(s.fileName); setSheetName(s.sheetName); setTagging(!!s.tagging);
+    setOriginalMode(s.originalMode || (s.keepOriginal === false ? "drop" : "cell"));
+    setSt(s.st); setCells(s.cells || []); setWb(null); setSavedSession(null);
+    setStep(s.cells?.length ? Math.max(s.step, 3) : 1);
+  };
+
+  const clearSaved = async (silent) => {
+    if (!silent && !confirm("Delete the saved session? Unsaved review progress in this tab is kept, but nothing will be restorable after a reload.")) return;
+    await clearSession(); setSavedSession(null); setLastSaved(null);
+  };
+
+  const resetAll = async () => {
+    if (!confirm("Clear saved progress and start over with a fresh upload?")) return;
+    await clearSession();
+    setSavedSession(null); setLastSaved(null); setWb(null); setSt(null); setCells([]);
+    setFileName(""); setSheetName(""); setTagging(false); setError(""); setStep(0);
+  };
+
+  /* ---------- upload ---------- */
+  const onFile = async (file) => {
+    setError("");
+    try {
+      const buf = await file.arrayBuffer();
+      const book = XLSX.read(buf, { type: "array" });
+      setWb(book); setFileName(file.name);
+      const preferred = book.SheetNames.find(n => /msc calendar/i.test(n)) || book.SheetNames[0];
+      pickSheet(book, preferred);
+    } catch (e) { setError("Could not read that file — is it a valid .xlsx? (" + e.message + ")"); }
+  };
+  const pickSheet = (book, name) => {
+    setSheetName(name);
+    const det = detectStructure(book.Sheets[name]);
+    setSt(det); setCells([]); setStep(1);
+  };
+
+  /* ---------- convert ---------- */
+  const runQueue = async (queue) => {
+    setProgress({ done: 0, total: queue.length });
+    setRunning(true); stopRef.current = false;
+    let done = 0;
+    const worker = async (delay) => {
+      await sleep(delay);                                    // stagger start
+      while (queue.length && !stopRef.current) {
+        const cell = queue.shift();
+        try {
+          const r = await callClaude(cell, tagging);
+          const lint = lintConverted(r.converted);
+          const conf = lint.length ? "low" : r.confidence;
+          setCells(prev => prev.map(x => x.id === cell.id ? { ...x, converted: r.converted, confidence: conf, issues: lint, notes: r.notes || "", status: conf === "high" ? "accepted" : "review" } : x));
+        } catch (e) {
+          setCells(prev => prev.map(x => x.id === cell.id ? { ...x, status: "error", issues: [`${e.message} — gave up after 4 tries; use Re-run AI`], notes: "" } : x));
+        }
+        done++; setProgress({ done, total: done + queue.length });
+        await sleep(400);                                    // gentle pacing between calls
+      }
+    };
+    await Promise.all([worker(0), worker(800)]);             // 2 workers: stays under rate limits
+    setRunning(false); setStep(3);
+  };
+
+  const startConvert = async () => {
+    if (!hasKey) { setError("Add an Anthropic API key (top right) to run AI conversion, or import a session someone already converted."); return; }
+    const list = buildCells(st);
+    setCells(list); setStep(2);
+    await runQueue(list.filter(c => c.kind === "ai"));
+  };
+
+  const resumeConvert = async () => {
+    if (!hasKey) { setError("Add an API key to run AI conversion."); return; }
+    const queue = cells.filter(c => c.kind === "ai" && c.status === "pending");
+    if (!queue.length) return;
+    setStep(2);
+    await runQueue(queue);
+  };
+
+  const retryErrors = async () => {
+    if (!hasKey) { setError("Add an API key to run AI conversion."); return; }
+    const queue = cells.filter(c => c.kind === "ai" && c.status === "error");
+    if (!queue.length) return;
+    setCells(prev => prev.map(x => x.status === "error" ? { ...x, status: "pending", notes: "" } : x));
+    setStep(2);
+    await runQueue(queue);
+  };
+
+  const redoCell = async (cell) => {
+    if (!hasKey) { setError("Add an API key to re-run AI on a cell."); return; }
+    setCells(prev => prev.map(x => x.id === cell.id ? { ...x, busy: true } : x));
+    try {
+      const r = await callClaude(cell, tagging);
+      const lint = lintConverted(r.converted);
+      const conf = lint.length ? "low" : r.confidence;
+      setCells(prev => prev.map(x => x.id === cell.id ? { ...x, converted: r.converted, confidence: conf, issues: lint, notes: r.notes || "", status: "review", busy: false } : x));
+    } catch (e) {
+      setCells(prev => prev.map(x => x.id === cell.id ? { ...x, status: "error", issues: [e.message], notes: "", busy: false } : x));
+    }
+  };
+
+  const setCell = (id, patch) => setCells(prev => prev.map(x => x.id === id ? { ...x, ...patch } : x));
+
+  /* ---------- exports ---------- */
+  const finalGrid = useMemo(() => {
+    if (!st) return null;
+    const g = st.grid.map(row => [...row]);
+    for (const c of cells) if (c.converted && c.status !== "error" && c.status !== "pending") {
+      const clean = stripOriginal(c.converted);            // remove any legacy () block from old sessions
+      g[c.r][c.c] = originalMode === "cell" && c.kind === "ai" ? `${clean}\n\n(${c.original.trim()})` : clean;
+    }
+    return g;
+  }, [st, cells, originalMode]);
+
+  const downloadXlsx = () => {
+    const ws = XLSX.utils.aoa_to_sheet(finalGrid);
+    ws["!merges"] = st.merges;
+    ws["!cols"] = finalGrid[st.headerRow].map((_, i) => ({ wch: i === 0 ? 22 : 42 }));
+    if (originalMode === "comment") {
+      for (const cell of cells) {
+        if (!cell.converted || cell.status === "error" || cell.status === "pending" || cell.kind === "header") continue;
+        const addr = XLSX.utils.encode_cell({ r: cell.r, c: cell.c });
+        if (ws[addr]) { ws[addr].c = [{ a: "Calendar Converter", t: "Original:\n" + cell.original }]; ws[addr].c.hidden = true; }
+      }
+    }
+    const book = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(book, ws, sheetName.slice(0, 31));
+    const fn = fileName.replace(/\.xlsx?$/i, "") + "_UNIFIED.xlsx";
+    try {
+      const out = XLSX.write(book, { bookType: "xlsx", type: "array" });
+      const blob = new Blob([out], { type: "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = fn; a.rel = "noopener"; a.style.display = "none";
+      document.body.appendChild(a); a.click();
+      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+    } catch {
+      setError("The .xlsx download was blocked by the browser sandbox. Use the “Copy for Google Sheets” export instead, or try a different browser — Chrome/Firefox usually allow the download.");
+    }
+  };
+
+  /* try to download text without navigating the frame; return false if blocked so caller can show the modal */
+  const tryDownloadText = (text, filename, mime = "application/json") => {
+    try {
+      const blob = new Blob([text], { type: mime });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url; a.download = filename; a.rel = "noopener";
+      a.style.display = "none";
+      document.body.appendChild(a);
+      a.click();
+      setTimeout(() => { document.body.removeChild(a); URL.revokeObjectURL(url); }, 1000);
+      return true;
+    } catch { return false; }
+  };
+
+  const copyText = async (text) => {
+    try { await navigator.clipboard.writeText(text); return true; } catch { /* */ }
+    try {
+      const ta = document.createElement("textarea");
+      ta.value = text; ta.style.position = "fixed"; ta.style.left = "-9999px";
+      document.body.appendChild(ta); ta.focus(); ta.select();
+      const ok = document.execCommand("copy"); document.body.removeChild(ta);
+      return ok;
+    } catch { return false; }
+  };
+
+  const buildTsv = () => finalGrid.map(row => row.map(v => {
+    const s = String(v ?? "");
+    return /[\t\n"]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+  }).join("\t")).join("\n");
+
+  const copyTsv = async () => {
+    const tsv = buildTsv();
+    if (await copyText(tsv)) { setCopied(true); setTimeout(() => setCopied(false), 2500); return; }
+    setTextOut({ title: "Copy for Google Sheets", text: tsv, filename: null, note: "Automatic copy was blocked by the browser sandbox. Click inside the box, select all (Cmd/Ctrl+A), copy (Cmd/Ctrl+C), then paste at cell A1 of your Google Sheet." });
+  };
+
+  const downloadJson = () => {
+    const events = extractEvents(cells.filter(c => c.status === "accepted" || c.status === "auto" || c.status === "review"));
+    const text = JSON.stringify({ source: fileName, sheet: sheetName, generated: new Date().toISOString(), events }, null, 2);
+    const fn = fileName.replace(/\.xlsx?$/i, "") + "_events.json";
+    if (!tryDownloadText(text, fn)) setTextOut({ title: "Events JSON", text, filename: fn, note: "The download was blocked by the browser sandbox. Copy this and save it as the filename below." });
+  };
+
+  /* ---------- session handoff (export → colleague imports for review) ---------- */
+  const exportSession = () => {
+    const payload = JSON.stringify({ v: 1, kind: "calconv-session", ts: Date.now(), fileName, sheetName, tagging, originalMode, st, cells });
+    const fn = fileName.replace(/\.xlsx?$/i, "") + "_session.json";
+    if (!tryDownloadText(payload, fn)) setTextOut({ title: "Session for review", text: payload, filename: fn, note: "The download was blocked by the browser sandbox. Copy all of this and save it in a plain text file named as below (colleague imports it on the upload screen). Tip: the .xlsx / Copy exports work independently if you only need the result." });
+  };
+
+  const importSession = async (file) => {
+    setError("");
+    try {
+      const s = JSON.parse(await file.text());
+      if (!s.cells || !s.st) throw new Error("not a valid session file");
+      skipNextSave.current = true;
+      setFileName(s.fileName || file.name); setSheetName(s.sheetName || "");
+      setTagging(!!s.tagging); setOriginalMode(s.originalMode || "drop");
+      setSt(s.st); setCells(s.cells); setWb(null); setSavedSession(null);
+      setStep(3);
+    } catch (e) { setError("Could not load that session file — " + e.message); }
+  };
+
+  /* ---------- derived ---------- */
+  const counts = useMemo(() => {
+    const c = { review: 0, accepted: 0, auto: 0, error: 0, pending: 0 };
+    for (const x of cells) c[x.status] = (c[x.status] || 0) + 1;
+    return c;
+  }, [cells]);
+
+  const shown = useMemo(() => cells.filter(c =>
+    filter === "all" ? true : filter === "review" ? (c.status === "review" || c.status === "error") : c.status === filter
+  ), [cells, filter]);
+
+  const eventCount = useMemo(() => extractEvents(cells).length, [cells]);
+
+  /* ============================ render ============================ */
+  return (
+    <div style={{ minHeight: "100vh", background: S.paper, color: S.ink, fontFamily: S.sans }}>
+      <style>{`
+        textarea:focus, button:focus-visible, input:focus { outline: 2px solid ${S.accent}; outline-offset: 1px; }
+        @keyframes ccspin { to { transform: rotate(360deg); } }
+        .ccspinner { display: inline-block; width: 11px; height: 11px; border: 2px solid currentColor; border-top-color: transparent; border-radius: 50%; animation: ccspin 0.7s linear infinite; vertical-align: -1px; }
+        @media (prefers-reduced-motion: reduce) { * { transition: none !important; } .ccspinner { animation-duration: 1.4s; } }
+      `}</style>
+
+      {/* header */}
+      <div style={{ borderBottom: `1px solid ${S.line}`, background: S.panel, padding: "14px 26px", display: "flex", alignItems: "baseline", gap: 18, flexWrap: "wrap" }}>
+        <div style={{ fontFamily: S.mono, fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>CALENDAR&nbsp;/&nbsp;UNIFY</div>
+        <div style={{ fontSize: 12.5, color: S.muted }}>messy cells → <span style={{ fontFamily: S.mono }}>[YYYY-MM-DD] Weekday HH:MM-HH:MM TZ | Title;</span></div>
+        <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
+          <ApiKeyControl apiKey={apiKey} onChange={(k) => { setApiKey(k); setApiKeyStored(k); }} />
+          {step > 0 && (
+            <span style={{ fontFamily: S.mono, fontSize: 10, color: storageAvailable() ? "#9AA69E" : S.amber, marginRight: 6 }}>
+              {storageAvailable() ? (lastSaved ? `saved ${new Date(lastSaved).toLocaleTimeString()}` : "autosave on") : "autosave unavailable"}
+            </span>
+          )}
+          {step > 0 && <button onClick={resetAll} title="Clear saved progress and start over" style={{ fontFamily: S.mono, fontSize: 10.5, padding: "4px 9px", borderRadius: 3, border: `1px solid ${S.line}`, background: "#fff", color: S.muted, cursor: "pointer", marginRight: 8 }}>↺ RESTART</button>}
+          {STEP_NAMES.map((n, i) => (
+            <div key={n} onClick={() => { if (i < step && !running) setStep(i); }} style={{
+              fontFamily: S.mono, fontSize: 11, letterSpacing: "0.05em", padding: "4px 10px", borderRadius: 3,
+              cursor: i < step && !running ? "pointer" : "default",
+              background: i === step ? S.accent : "transparent", color: i === step ? "#fff" : i < step ? S.accent : "#B7BDC3",
+            }}>{i + 1}·{n.toUpperCase()}</div>
+          ))}
+        </div>
+      </div>
+
+      <div style={{ maxWidth: 1060, margin: "0 auto", padding: "28px 22px 80px" }}>
+        {error && <div style={{ background: S.redSoft, color: S.red, borderRadius: 6, padding: "10px 14px", marginBottom: 16, fontSize: 13 }}>{error}</div>}
+
+        {/* ---------- STEP 0 : upload ---------- */}
+        {step === 0 && (
+          <div>
+            {savedSession && (
+              <div style={{ background: S.accentSoft, border: `1px solid ${S.accent}`, borderRadius: 10, padding: "16px 20px", marginBottom: 18, display: "flex", gap: 16, alignItems: "center", flexWrap: "wrap" }}>
+                <div style={{ flex: 1, minWidth: 240 }}>
+                  <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 3 }}>Saved session found</div>
+                  <div style={{ fontSize: 12.5, color: S.muted }}>
+                    {savedSession.fileName} · {savedSession.sheetName} · {savedSession.cells.length} cells
+                    ({savedSession.cells.filter(c => c.status === "accepted" || c.status === "auto").length} done,
+                    {" "}{savedSession.cells.filter(c => c.status === "pending").length} unconverted)
+                    · saved {new Date(savedSession.ts).toLocaleString()}
+                  </div>
+                </div>
+                <Btn primary onClick={restoreSaved}>Continue from there</Btn>
+                <Btn small onClick={() => clearSaved(false)}>Discard</Btn>
+              </div>
+            )}
+            <div onClick={() => fileRef.current?.click()}
+              onDragOver={e => e.preventDefault()}
+              onDrop={e => { e.preventDefault(); const f = e.dataTransfer.files?.[0]; if (f) onFile(f); }}
+              style={{ border: `1.5px dashed ${S.accent}`, borderRadius: 10, background: S.panel, padding: "70px 30px", textAlign: "center", cursor: "pointer" }}>
+              <div style={{ fontFamily: S.mono, fontSize: 15, fontWeight: 600, marginBottom: 8 }}>Drop the .xlsx here, or click to choose</div>
+              <div style={{ fontSize: 13, color: S.muted }}>Merged cells and layout are read from the file; only cell text is changed.</div>
+              <input ref={fileRef} type="file" accept=".xlsx,.xlsm" style={{ display: "none" }} onChange={e => e.target.files?.[0] && onFile(e.target.files[0])} />
+            </div>
+            <div style={{ marginTop: 14, display: "flex", alignItems: "center", gap: 10, fontSize: 12.5, color: S.muted }}>
+              <span>Received a session file to review?</span>
+              <input ref={sessionRef} type="file" accept=".json,.txt,application/json,text/plain" style={{ display: "none" }} onChange={e => e.target.files?.[0] && importSession(e.target.files[0])} />
+              <button onClick={() => sessionRef.current?.click()} style={{ fontFamily: S.mono, fontSize: 12, padding: "6px 13px", borderRadius: 5, border: `1px solid ${S.accent}`, background: S.accentSoft, color: S.accent, cursor: "pointer" }}>Import session (.json)</button>
+              <span>— opens straight in Review, no API calls needed.</span>
+            </div>
+            <div style={{ marginTop: 22, fontSize: 12.5, color: S.muted, lineHeight: 1.7 }}>
+              <b>How it works:</b> the app detects the module columns and week rows, sends each dated cell to Claude for structured extraction (clean text-only cells are handled locally), then shows everything for your review before export. Progress autosaves in this browser as you go, so you can close the tab and resume later.
+            </div>
+          </div>
+        )}
+
+        {/* ---------- STEP 1 : mapping ---------- */}
+        {step === 1 && st && (
+          <div>
+            <div style={{ display: "flex", alignItems: "baseline", gap: 14, marginBottom: 14, flexWrap: "wrap" }}>
+              <h2 style={{ fontSize: 17, margin: 0 }}>Confirm the column map</h2>
+              <span style={{ fontSize: 12.5, color: S.muted }}>{fileName} · sheet:</span>
+              {wb ? (
+                <select value={sheetName} onChange={e => pickSheet(wb, e.target.value)} style={{ fontFamily: S.sans, fontSize: 13, padding: "4px 8px", borderRadius: 4, border: `1px solid ${S.line}` }}>
+                  {wb.SheetNames.map(n => <option key={n}>{n}</option>)}
+                </select>
+              ) : <span style={{ fontFamily: S.mono, fontSize: 12.5 }}>{sheetName} <span style={{ color: S.muted, fontFamily: S.sans }}>(restored session — re-upload the file to switch sheets)</span></span>}
+            </div>
+            <div style={{ background: S.panel, border: `1px solid ${S.line}`, borderRadius: 8, overflow: "hidden" }}>
+              <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 13 }}>
+                <thead><tr style={{ background: "#F0F2EF", fontFamily: S.mono, fontSize: 11, letterSpacing: "0.05em" }}>
+                  {["USE", "COL", "COLUMN HEADER", "CODE", "LEADER", "YEAR BAND"].map(h => <th key={h} style={{ textAlign: "left", padding: "8px 12px" }}>{h}</th>)}
+                </tr></thead>
+                <tbody>
+                  {st.mapping.map((m, i) => {
+                    const yc = YEAR_COLORS[m.year] || YEAR_COLORS.Other;
+                    return (
+                      <tr key={m.col} style={{ borderTop: `1px solid ${S.line}`, opacity: m.include ? 1 : 0.45 }}>
+                        <td style={{ padding: "7px 12px" }}><input type="checkbox" checked={m.include} onChange={e => { const mp = [...st.mapping]; mp[i] = { ...m, include: e.target.checked }; setSt({ ...st, mapping: mp }); }} /></td>
+                        <td style={{ padding: "7px 12px", fontFamily: S.mono }}>{colLetter(m.col + 1)}</td>
+                        <td style={{ padding: "7px 12px", maxWidth: 340 }}>{m.name}</td>
+                        <td style={{ padding: "7px 12px" }}><input value={m.code} placeholder="—" onChange={e => { const mp = [...st.mapping]; mp[i] = { ...m, code: e.target.value }; setSt({ ...st, mapping: mp }); }} style={{ fontFamily: S.mono, fontSize: 12, width: 105, border: `1px solid ${S.line}`, borderRadius: 4, padding: "3px 6px" }} /></td>
+                        <td style={{ padding: "7px 12px" }}><input value={m.leader} onChange={e => { const mp = [...st.mapping]; mp[i] = { ...m, leader: e.target.value }; setSt({ ...st, mapping: mp }); }} style={{ fontFamily: S.mono, fontSize: 12, width: 90, border: `1px solid ${S.line}`, borderRadius: 4, padding: "3px 6px" }} /></td>
+                        <td style={{ padding: "7px 12px" }}><Tag color={yc.ink} bg={yc.band}>{m.year}</Tag></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+            <label style={{ display: "flex", gap: 10, alignItems: "flex-start", marginTop: 18, background: S.panel, border: `1px solid ${S.line}`, borderRadius: 8, padding: "13px 16px", cursor: "pointer", maxWidth: 640 }}>
+              <input type="checkbox" checked={tagging} onChange={e => setTagging(e.target.checked)} style={{ marginTop: 3 }} />
+              <span style={{ fontSize: 13, lineHeight: 1.55 }}>
+                <b>Tag events with module info</b> — appends <span style={{ fontFamily: S.mono, fontSize: 12 }}>[7501ALEFTP]</span> to every event line and adds the leader's initials when no facilitator is named. Makes each line self-contained; leave off to keep cells shorter.
+              </span>
+            </label>
+            <div style={{ marginTop: 22, display: "flex", gap: 12, alignItems: "center" }}>
+              <Btn primary onClick={startConvert}>Convert sheet</Btn>
+              {!hasKey && <span style={{ fontSize: 12.5, color: S.amber }}>⚑ Needs an API key (top right) to run conversion.</span>}
+              <span style={{ fontSize: 12.5, color: S.muted }}>Detected rows — header: {st.headerRow + 1}, leaders: {st.leaderRow + 1}, data: {st.dataStart + 1}–{st.lastRow + 1}</span>
+            </div>
+          </div>
+        )}
+
+        {/* ---------- STEP 2 : converting ---------- */}
+        {step === 2 && (
+          <div style={{ textAlign: "center", paddingTop: 50 }}>
+            <div style={{ fontFamily: S.mono, fontSize: 15, marginBottom: 14 }}>
+              Converting… {progress.done} / {progress.total} cells
+            </div>
+            <div style={{ width: 420, maxWidth: "88%", height: 8, background: "#E7EAE6", borderRadius: 4, margin: "0 auto", overflow: "hidden" }}>
+              <div style={{ width: `${progress.total ? (100 * progress.done / progress.total) : 0}%`, height: "100%", background: S.accent, transition: "width .3s" }} />
+            </div>
+            <div style={{ fontSize: 12.5, color: S.muted, marginTop: 16 }}>4 cells at a time · text-only cells were handled locally · keep this tab open</div>
+            <div style={{ marginTop: 24 }}><Btn small onClick={() => { stopRef.current = true; }}>Stop & review what's done</Btn></div>
+          </div>
+        )}
+
+        {/* ---------- STEP 3 : review ---------- */}
+        {step === 3 && (
+          <div>
+            <div style={{ display: "flex", gap: 8, alignItems: "center", marginBottom: 16, flexWrap: "wrap" }}>
+              <h2 style={{ fontSize: 17, margin: 0, marginRight: 8 }}>Review</h2>
+              {[["review", `Needs review · ${counts.review + counts.error}`], ["accepted", `Accepted · ${counts.accepted}`], ["auto", `Auto (notes) · ${counts.auto}`], ["all", "All"]].map(([k, label]) => (
+                <button key={k} onClick={() => setFilter(k)} style={{ fontFamily: S.mono, fontSize: 11.5, padding: "5px 11px", borderRadius: 4, cursor: "pointer", border: `1px solid ${filter === k ? S.accent : S.line}`, background: filter === k ? S.accentSoft : "#fff", color: filter === k ? S.accent : S.muted }}>{label}</button>
+              ))}
+              <div style={{ marginLeft: "auto", display: "flex", gap: 10, alignItems: "center" }}>
+                <span style={{ fontSize: 12, color: S.muted }}>{eventCount} events parsed</span>
+                {counts.error > 0 && <Btn small danger onClick={retryErrors}>↻ Retry {counts.error} failed</Btn>}
+                {counts.pending > 0 && <Btn small primary onClick={resumeConvert}>▶ Convert remaining {counts.pending}</Btn>}
+                <Btn small onClick={exportSession}>⤓ Session for review</Btn>
+                <Btn primary onClick={() => setStep(4)}>Go to export →</Btn>
+              </div>
+            </div>
+
+            {shown.length === 0 && <div style={{ color: S.muted, fontSize: 13, padding: 30, textAlign: "center" }}>Nothing in this filter — everything's handled. 🎉</div>}
+
+            {shown.map(cell => {
+              const yc = YEAR_COLORS[cell.module?.year] || YEAR_COLORS.Other;
+              const conf = CONF_STYLE[cell.confidence] || CONF_STYLE.medium;
+              return (
+                <div key={cell.id} style={{ background: S.panel, border: `1px solid ${S.line}`, borderLeft: `4px solid ${yc.band}`, borderRadius: 8, marginBottom: 14, overflow: "hidden" }}>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center", padding: "9px 14px", borderBottom: `1px solid ${S.line}`, background: "#FBFCFA", flexWrap: "wrap" }}>
+                    <span style={{ fontFamily: S.mono, fontSize: 12, fontWeight: 700 }}>{colLetter(cell.c + 1)}{cell.r + 1}</span>
+                    <Tag color={yc.ink} bg={yc.band}>{cell.module?.code || cell.module?.year || "—"}</Tag>
+                    {cell.week && <span style={{ fontSize: 11.5, color: S.muted }}>{cell.week.label}</span>}
+                    <span style={{ flex: 1 }} />
+                    {cell.confidence && <Tag color={conf.c} bg={conf.bg} title={conf.tip}>{conf.label}</Tag>}
+                    {cell.status === "error" && <Tag color={S.red} bg={S.redSoft}>API error</Tag>}
+                    {cell.status === "accepted" && <Tag color={S.green} bg={S.greenSoft}>accepted</Tag>}
+                  </div>
+                  {cell.issues?.length > 0 && (
+                    <div style={{ padding: "8px 14px", fontSize: 12.5, color: S.red, background: S.redSoft, borderTop: `1px solid ${S.redSoft}`, lineHeight: 1.5 }}>
+                      {cell.issues.map((iss, i) => <div key={i}>⚠ {iss}</div>)}
+                    </div>
+                  )}
+                  {cell.notes && (cell.confidence === "medium" || cell.confidence === "low") ? (
+                    <div style={{ padding: "8px 14px", fontSize: 12.5, color: S.amber, background: S.amberSoft, borderTop: `1px solid ${S.amberSoft}`, lineHeight: 1.5 }}>
+                      ⚑ {cell.notes}
+                    </div>
+                  ) : cell.notes ? (
+                    <div style={{ padding: "5px 14px", background: "#FBFCFA", borderTop: `1px solid ${S.line}` }}>
+                      <button onClick={() => setCell(cell.id, { notesOpen: !cell.notesOpen })} style={{ fontFamily: S.mono, fontSize: 10.5, letterSpacing: "0.04em", color: S.muted, background: "none", border: "none", cursor: "pointer", padding: "3px 0" }}>
+                        {cell.notesOpen ? "▾ hide reasoning" : "▸ reasoning"}
+                      </button>
+                      {cell.notesOpen && <div style={{ fontSize: 12, color: S.muted, lineHeight: 1.5, paddingBottom: 6 }}>{cell.notes}</div>}
+                    </div>
+                  ) : null}
+                  <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 0 }}>
+                    <div style={{ padding: "12px 14px", borderRight: `1px solid ${S.line}` }}>
+                      <div style={{ fontFamily: S.mono, fontSize: 10, letterSpacing: "0.08em", color: "#AEB4BA", marginBottom: 6 }}>ORIGINAL</div>
+                      <pre style={{ margin: 0, fontFamily: S.sans, fontSize: 12.5, lineHeight: 1.55, whiteSpace: "pre-wrap", wordBreak: "break-word", color: "#4A5058" }}>{cell.original}</pre>
+                    </div>
+                    <div style={{ padding: "12px 14px" }}>
+                      <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                        <span style={{ fontFamily: S.mono, fontSize: 10, letterSpacing: "0.08em", color: "#AEB4BA" }}>UNIFIED · editable</span>
+                        {cell.dirty && <span style={{ fontFamily: S.mono, fontSize: 9.5, color: S.green }}>saved ✓</span>}
+                      </div>
+                      <textarea value={cell.converted} onChange={e => setCell(cell.id, { converted: e.target.value, dirty: true, issues: lintConverted(e.target.value) })}
+                        spellCheck={false}
+                        style={{ width: "100%", minHeight: 120, fontFamily: S.mono, fontSize: 12.5, lineHeight: 1.6, color: S.ink, border: `1px solid ${S.line}`, borderRadius: 5, padding: 8, boxSizing: "border-box", resize: "vertical", background: cell.status === "accepted" ? "#FCFDFB" : "#fff" }} />
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, padding: "9px 14px", borderTop: `1px solid ${S.line}`, alignItems: "center" }}>
+                    {cell.status !== "accepted"
+                      ? <Btn small primary onClick={() => setCell(cell.id, { status: "accepted", dirty: false })}>Accept</Btn>
+                      : <Btn small onClick={() => setCell(cell.id, { status: "review" })}>Un-accept</Btn>}
+                    {cell.kind === "ai" && <Btn small disabled={cell.busy} onClick={() => redoCell(cell)}>{cell.busy ? <><span className="ccspinner" /> Re-running…</> : "Re-run AI"}</Btn>}
+                    <span style={{ fontSize: 11.5, color: S.muted, marginLeft: 4 }}>Edits save automatically.</span>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        )}
+
+        {/* ---------- STEP 4 : export ---------- */}
+        {step === 4 && st && (
+          <div>
+            <h2 style={{ fontSize: 17, marginTop: 0 }}>Export</h2>
+            <div style={{ fontSize: 13, color: S.muted, marginBottom: 20 }}>
+              {counts.accepted + counts.auto} cells converted · {counts.review} still marked "needs review" (they export as-converted) · {eventCount} machine-readable events.
+            </div>
+            <div style={{ background: S.panel, border: `1px solid ${S.line}`, borderRadius: 8, padding: "14px 16px", marginBottom: 18, maxWidth: 680, boxSizing: "border-box" }}>
+              <div style={{ fontWeight: 700, fontSize: 13.5, marginBottom: 9 }}>Where should the old cell text go?</div>
+              {[
+                ["cell", "In the cell", "kept in (parentheses) below the structured lines — visible everywhere, cells are longer"],
+                ["comment", "As a cell comment", ".xlsx download only — the cell stays clean, original attached as a hidden comment (imports into Google Sheets as a note). The copy-paste export can't carry comments, so it exports clean cells."],
+                ["drop", "Removed", "clean structured lines only, original discarded"],
+              ].map(([val, label, desc]) => (
+                <label key={val} style={{ display: "flex", gap: 9, alignItems: "flex-start", padding: "5px 0", cursor: "pointer" }}>
+                  <input type="radio" name="origmode" checked={originalMode === val} onChange={() => setOriginalMode(val)} style={{ marginTop: 3 }} />
+                  <span style={{ fontSize: 13, lineHeight: 1.5 }}><b>{label}</b> — <span style={{ color: S.muted }}>{desc}</span></span>
+                </label>
+              ))}
+              <div style={{ fontSize: 11.5, color: S.muted, marginTop: 6 }}>Applies instantly to the exports below — no re-conversion needed. The events .json is unaffected.</div>
+            </div>
+            <div style={{ display: "grid", gap: 14, maxWidth: 680 }}>
+              {[
+                ["Copy for Google Sheets", "Copies the whole sheet as paste-ready cells. Paste at A1 of your Google Sheet — existing colours, merges and formatting stay untouched, only text changes. Recommended.", copyTsv, true],
+                ["Download .xlsx", "Structure and merged cells preserved. Note: cell colours/fonts are not carried over by the exporter — use the copy-paste route if you want to keep the current styling.", downloadXlsx, false],
+                ["Download events .json", "All parsed events as structured data — the input for the Apps Script suite (calendar generation, availability grid, overlap checks).", downloadJson, false],
+              ].map(([title, desc, fn, primary]) => (
+                <div key={title} style={{ background: S.panel, border: `1px solid ${S.line}`, borderRadius: 8, padding: "16px 18px", display: "flex", gap: 16, alignItems: "center" }}>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 700, fontSize: 14, marginBottom: 4 }}>{title}</div>
+                    <div style={{ fontSize: 12.5, color: S.muted, lineHeight: 1.55 }}>{desc}</div>
+                  </div>
+                  <Btn primary={primary} onClick={fn}>{fn === copyTsv && copied ? "Copied ✓" : title.split(" ")[0]}</Btn>
+                </div>
+              ))}
+            </div>
+            <div style={{ fontSize: 12, color: S.muted, marginTop: 12, maxWidth: 680, lineHeight: 1.5 }}>
+              After copying: open your Google Sheet, click cell <b>A1</b> of the target tab (single click — not double-click into edit mode), then paste with Cmd/Ctrl+V. The rows split across cells automatically and your existing colours/formatting stay put.
+            </div>
+            <div style={{ marginTop: 24 }}><Btn small onClick={() => setStep(3)}>← Back to review</Btn></div>
+          </div>
+        )}
+
+        {textOut !== null && (
+          <div onClick={() => setTextOut(null)} style={{ position: "fixed", inset: 0, background: "rgba(20,24,28,0.5)", display: "flex", alignItems: "center", justifyContent: "center", zIndex: 50, padding: 20 }}>
+            <div onClick={e => e.stopPropagation()} style={{ background: "#fff", borderRadius: 10, padding: 20, maxWidth: 760, width: "100%", maxHeight: "84vh", display: "flex", flexDirection: "column", gap: 12 }}>
+              <div style={{ fontWeight: 700, fontSize: 15 }}>{textOut.title}</div>
+              <div style={{ fontSize: 13, color: S.muted, lineHeight: 1.5 }}>{textOut.note}{textOut.filename && <> Save it as <b style={{ fontFamily: S.mono, color: S.ink }}>{textOut.filename}</b>.</>}</div>
+              <textarea readOnly value={textOut.text} onFocus={e => e.target.select()} style={{ width: "100%", flex: 1, minHeight: 260, fontFamily: S.mono, fontSize: 11.5, lineHeight: 1.5, border: `1px solid ${S.line}`, borderRadius: 6, padding: 10, boxSizing: "border-box", whiteSpace: "pre", overflow: "auto" }} />
+              <div style={{ display: "flex", gap: 10, justifyContent: "flex-end" }}>
+                <Btn small onClick={() => setTextOut(null)}>Close</Btn>
+                <Btn small primary onClick={async () => { const ok = await copyText(textOut.text); setCopied(ok); setTimeout(() => setCopied(false), 2000); }}>{copied ? "Copied ✓" : "Copy all"}</Btn>
+              </div>
+            </div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+
+const root = ReactDOM.createRoot(document.getElementById("root"));
+root.render(<CalendarConverter />);
+</script>
+</body>
+</html>
