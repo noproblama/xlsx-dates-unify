@@ -22,7 +22,7 @@
 
 <script type="text/babel" data-presets="react">
 const { useState, useRef, useMemo, useCallback, useEffect } = React;
-const XLSX = window.XLSX;
+/* XLSX is already a global from the SheetJS CDN script — do not redeclare it. */
 
 
 /* ---------- session persistence (localStorage in standalone build) ---------- */
