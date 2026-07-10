@@ -25,22 +25,37 @@ const { useState, useRef, useMemo, useCallback, useEffect } = React;
 /* XLSX is already a global from the SheetJS CDN script — do not redeclare it. */
 
 
-/* ---------- session persistence (localStorage in standalone build) ---------- */
+/* ---------- environment detection ----------
+ * Claude artifacts expose window.storage (the artifact KV store) and let
+ * fetch() to the Anthropic API work with no key. GitHub Pages / any other
+ * host has neither, so we require an API key there. We probe window.storage. */
+const IS_ARTIFACT = (typeof window !== "undefined" && !!window.storage &&
+  typeof window.storage.get === "function" && typeof window.storage.set === "function");
+
+/* ---------- session persistence ----------
+ * Artifact mode → window.storage (per-user, survives across sessions).
+ * Standalone   → localStorage. */
 const SAVE_KEY = "calconv-session-v1";
-const storageAvailable = () => { try { const k="__t"; localStorage.setItem(k,"1"); localStorage.removeItem(k); return true; } catch { return false; } };
+const localOK = () => { try { const k="__t"; localStorage.setItem(k,"1"); localStorage.removeItem(k); return true; } catch { return false; } };
+const storageAvailable = () => IS_ARTIFACT || localOK();
 async function saveSession(payload) {
+  if (IS_ARTIFACT) { try { await window.storage.set(SAVE_KEY, JSON.stringify(payload)); return true; } catch { return false; } }
   try { localStorage.setItem(SAVE_KEY, JSON.stringify(payload)); return true; } catch { return false; }
 }
 async function loadSession() {
+  if (IS_ARTIFACT) { try { const r = await window.storage.get(SAVE_KEY); return r && r.value ? JSON.parse(r.value) : null; } catch { return null; } }
   try { const v = localStorage.getItem(SAVE_KEY); return v ? JSON.parse(v) : null; } catch { return null; }
 }
 async function clearSession() {
+  if (IS_ARTIFACT) { try { await window.storage.delete(SAVE_KEY); } catch {} return; }
   try { localStorage.removeItem(SAVE_KEY); } catch {}
 }
-/* API key persisted locally so colleagues need only paste it once */
+/* API key — only used/persisted in standalone mode. In artifact mode it's ignored. */
 const KEY_STORE = "calconv-apikey";
-const getApiKey = () => { try { return localStorage.getItem(KEY_STORE) || ""; } catch { return ""; } };
-const setApiKeyStored = (k) => { try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch {} };
+const getApiKey = () => { if (IS_ARTIFACT) return ""; try { return localStorage.getItem(KEY_STORE) || ""; } catch { return ""; } };
+const setApiKeyStored = (k) => { if (IS_ARTIFACT) return; try { k ? localStorage.setItem(KEY_STORE, k) : localStorage.removeItem(KEY_STORE); } catch {} };
+/* whether AI conversion is available right now (artifact: always; standalone: needs a key) */
+const canConvert = () => IS_ARTIFACT || !!getApiKey();
 
 /* ============================================================
    Academic Calendar Converter — "Registrar's Workbench"
@@ -257,14 +272,15 @@ async function callClaude(cell, tagging) {
   for (let attempt = 1; attempt <= MAX_TRIES; attempt++) {
     try {
       const strict = attempt > 1 ? "\n\nIMPORTANT: reply with ONLY the raw JSON object, starting with { and ending with }. No explanation, no preamble, no markdown." : "";
+      const headers = { "Content-Type": "application/json" };
+      if (!IS_ARTIFACT) {
+        headers["x-api-key"] = getApiKey();
+        headers["anthropic-version"] = "2023-06-01";
+        headers["anthropic-dangerous-direct-browser-access"] = "true";
+      }
       const res = await fetch("https://api.anthropic.com/v1/messages", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-api-key": getApiKey(),
-          "anthropic-version": "2023-06-01",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
+        headers,
         body: JSON.stringify({
           model: "claude-sonnet-4-6", max_tokens: 1000,
           system: systemPrompt(tagging),
@@ -443,7 +459,7 @@ function CalendarConverter() {
   const [filter, setFilter] = useState("review");
   const [error, setError] = useState("");
   const [apiKey, setApiKey] = useState(getApiKey());
-  const hasKey = !!apiKey;
+  const hasKey = IS_ARTIFACT || !!apiKey;  // artifact: always; standalone: once a key is set
   const [savedSession, setSavedSession] = useState(null);   // found on mount, offered for resume
   const [lastSaved, setLastSaved] = useState(null);
   const stopRef = useRef(false);
@@ -695,7 +711,7 @@ function CalendarConverter() {
         <div style={{ fontFamily: S.mono, fontWeight: 700, fontSize: 15, letterSpacing: "0.02em" }}>CALENDAR&nbsp;/&nbsp;UNIFY</div>
         <div style={{ fontSize: 12.5, color: S.muted }}>messy cells → <span style={{ fontFamily: S.mono }}>[YYYY-MM-DD] Weekday HH:MM-HH:MM TZ | Title;</span></div>
         <div style={{ marginLeft: "auto", display: "flex", gap: 6, alignItems: "center" }}>
-          <ApiKeyControl apiKey={apiKey} onChange={(k) => { setApiKey(k); setApiKeyStored(k); }} />
+          {!IS_ARTIFACT && <ApiKeyControl apiKey={apiKey} onChange={(k) => { setApiKey(k); setApiKeyStored(k); }} />}
           {step > 0 && (
             <span style={{ fontFamily: S.mono, fontSize: 10, color: storageAvailable() ? "#9AA69E" : S.amber, marginRight: 6 }}>
               {storageAvailable() ? (lastSaved ? `saved ${new Date(lastSaved).toLocaleTimeString()}` : "autosave on") : "autosave unavailable"}
